@@ -1,0 +1,110 @@
+# dsh-plugin-taskbar-autohide
+
+DSH 插件：**DSH 窗口在前台时隐藏 Windows 底部的任务栏，切走时恢复。** 随 DSH 生命周期起停，附带 F11 真·全屏。
+
+## 它解决什么
+
+DSH 桌面版窗口只有"最大化"，没有 OS 级全屏（`F11` 未被绑定，实测按下去无反应），所以屏幕底部那 48px 永远是 Windows 任务栏。本插件让任务栏在 DSH 处于前台时消失，DSH 窗口随之长高 48px；切到别的窗口时任务栏立刻回来。
+
+## 为什么这样设计（稳定性来自哪里）
+
+前一代方案是"计划任务 + 隐藏的 powershell 每 700ms 轮询前台窗口"。它的失败模式很具体：**那个独立进程没人管，被系统/用户杀掉之后任务栏就永久停在错误状态**（实测日志在一次 `switched away` 之后戛然而止，既没有还原记录，进程也消失了）。
+
+本插件的每一处改动都针对这一点：
+
+| 维度 | 旧方案 | 本插件 |
+|---|---|---|
+| 触发 | 每 700ms 抽样，可能整段错过 | `SetWinEventHook` 事件驱动，焦点一变即决策 |
+| 状态一致性 | 进程内自记 `$current`，外部改动后会失同步 | 每次决策都**先读真实注册表状态**再决定，自动纠正漂移 |
+| 生命周期 | 独立计划任务，与 DSH 无关 | 挂在 DSH 宿主上：DSH 启动即开始，DSH 退出即还原 |
+| 崩溃 | 没有监管，死了就死了 | 插件监管助手（`exit` 事件 + 心跳超时），带退避自动重启 |
+| 宿主崩溃 | 无 | 助手检查父进程存活，宿主消失时自行退出并还原任务栏 |
+| 重复实例 | 多实例互相打架 | 命名互斥量单实例（HMR 交接时新实例等待旧实例退出） |
+| 兜底 | 无 | 周期性 resync：即使事件全丢，最多 `resyncMs` 后也会回到正确状态 |
+
+## 安装
+
+```powershell
+dsh plugin --profile desktop add link:C:\Users\ASUS\Desktop\dsh-plugin-taskbar-autohide
+```
+
+本机 desktop profile 已装好（`dsh.profile.bundles` + `link:` 到本目录）。实测**无需重启 DSH 即可热加载**；若你的 profile 没热加载，重启 DSH 即可（宿主半改动一般需要重启）。
+
+## 配置（`cordis.patch.yml` 的 `config`）
+
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `enabled` | `true` | 总开关；`false` = 插件在跑但不动任务栏 |
+| `processNames` | `['DeepSeek Harness']` | 认为"DSH 在前台"的进程名；浏览器里用 DSH 的可加 `msedge` 等 |
+| `baseline` | `visible` | DSH 失焦时任务栏应有的状态：`visible` 常显 / `autohide` 自动隐藏 |
+| `resyncMs` | `2000` | 兜底重扫周期（毫秒） |
+| `heartbeatMs` | `5000` | 助手心跳间隔 |
+| `staleHeartbeatMs` | `30000` | 超过此时长无心跳就判定假死并重启助手 |
+| `restartBackoffMs` / `restartBackoffMaxMs` | `2000` / `30000` | 重启退避 |
+| `dryRun` | `false` | **只记录决策、绝不改任务栏**（排查用） |
+| `stateDir` | `null` | 状态/日志目录；`null` = `%LOCALAPPDATA%\DshTaskbarAutohide` |
+
+运行期也可以通过状态文件热改（插件会自动同步）：
+
+```
+%LOCALAPPDATA%\DshTaskbarAutohide\state.conf
+  enabled=1        # 1/0
+  baseline=0       # 0=常显, 1=自动隐藏
+  names=DeepSeek Harness
+  shutdown=0       # 1 = 让助手先还原任务栏再退出
+```
+
+## F11 真·全屏（客户端半）
+
+渲染层半把 `F11` 接到 HTML5 `requestFullscreen()`：Electron 会把它变成真正的 OS 全屏，任务栏被整块盖住，连鼠标压到屏幕底边也不会弹出来。DSH 桌面端原本没绑定任何窗口级全屏键，所以不冲突。
+
+这是可选的便利键：宿主半的"自动隐藏"完全不依赖它，客户端半加载失败也只影响 F11。客户端半改动后需要刷新页面（或重启 DSH）才生效。
+
+## 诊断
+
+```powershell
+# 1. 助手日志（决策、切换、异常都在这里）
+Get-Content "$env:LOCALAPPDATA\DshTaskbarAutohide\helper.log" -Tail 30
+
+# 2. 只看决策不改动任务栏
+#    把 cordis.patch.yml 的 dryRun 改成 true，然后看日志里的 "dryRun decision"
+
+# 3. 助手是否在跑
+Get-CimInstance Win32_Process -Filter "Name='powershell.exe'" |
+  Where-Object { $_.CommandLine -match 'taskbar-watch' } |
+  Select-Object ProcessId, ParentProcessId
+
+# 4. 当前状态
+(Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\StuckRects3').Settings[8] -band 1
+#    1 = 任务栏自动隐藏生效，0 = 常显
+```
+
+其它 Cordis 插件也可以注入 `taskbarAutohide` 服务使用：
+
+```js
+export const inject = ['taskbarAutohide']
+export function apply(ctx) {
+  const api = ctx.taskbarAutohide
+  api.status()                 // { enabled, baseline, helperAlive, helperPid, restarts, ... }
+  api.setEnabled(false)        // 临时停用
+  api.setBaseline('autohide')  // 失焦时也保持隐藏
+  api.restart()                // 重启助手
+}
+```
+
+## 测试
+
+```powershell
+$node = "C:\Users\ASUS\.dsh\dsh-runtimes\dsh-primary-runtime\dependencies\node\bin\node.exe"
+& $node test\plugin.test.mjs
+```
+
+用假 ctx 跑真实插件，真实派生 powershell 助手（`dryRun`），断言：`apply()` 返回 `undefined`（Cordis effect 契约）、助手真的起来、**助手被强杀后插件自动重启它**、`api.restart()` 换进程、卸载后助手优雅退出且状态文件写上 `shutdown=1`。
+
+> 运行需要在**非沙箱**环境下执行：DSH 的 Windows 沙箱对工具子进程用的是受限令牌（`CreateRestrictedToken` + `WRITE_RESTRICTED`），会挡住子进程管道与注册表写入——而这正是插件派生助手时不会遇到的情况（宿主进程本身不受限）。
+
+## 已知边界
+
+- **注册表是唯一的真实开关**。实测在本机 `ABM_SETSTATE` 单独调用无效，`ShowWindow(Shell_TrayWnd, SW_HIDE)` 会被 explorer 立刻恢复；只有写 `StuckRects3` 的 `byte[8]` bit0 有效（`0x02` 常显 / `0x03` 自动隐藏）。
+- 隐藏方式是"自动隐藏"而非"销毁任务栏"，所以**鼠标压到屏幕最底边时仍会临时弹出**；要用真·全屏盖住它，按 `F11`。
+- `lib/taskbar-watch.ps1` 是**纯 ASCII** 的：Windows PowerShell 5.1 会把无 BOM 文件按 ANSI 解码，非 ASCII 内容（哪怕只是 C# 里的中文字符串）都会破坏编译。改这个文件时请保持 ASCII。
