@@ -1,1 +1,3 @@
 # dsh-hide-taskbar
+在启动全屏dsh时自动隐藏桌面状态栏
+deepseekharness的伪全屏不会隐藏桌面底部状态栏
