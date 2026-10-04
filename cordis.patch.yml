@@ -1,0 +1,26 @@
+# dsh-plugin-taskbar-autohide 的 bundle 挂载声明。
+#
+# DSH 启动时按 bundle 层栈叠加各插件的 patch，本文件把宿主半插入 profile 配置树。
+# 安装（profile 名按你的改，本机桌面端是 desktop）：
+#   dsh plugin --profile desktop add link:C:\Users\ASUS\Desktop\dsh-plugin-taskbar-autohide
+#
+# 宿主半改动通常需要重启 DSH 才会生效（见 README「生效时机」）。
+
+- insert:
+    - id: taskbar-autohide
+      name: 'dsh-plugin-taskbar-autohide'
+      config:
+        # 总开关：false = 插件在跑但不动任务栏
+        enabled: true
+        # DSH 窗口所属进程名；桌面端即 'DeepSeek Harness'
+        processNames:
+          - DeepSeek Harness
+        # DSH 失焦时任务栏应有的状态：visible = 常显（默认，等于没装插件时的样子）
+        baseline: visible
+        # 事件之外的兜底重扫周期（毫秒）
+        resyncMs: 2000
+        # 助手心跳与假死判定（毫秒）
+        heartbeatMs: 5000
+        staleHeartbeatMs: 30000
+        # 只记录决策、绝不改任务栏（排查用）
+        dryRun: false
